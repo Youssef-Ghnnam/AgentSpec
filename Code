@@ -1,0 +1,618 @@
+"""
+Agent-of-Agents: Minimal Python scaffold (improved)
+Windows / Python 3.13 compatible, stdlib-only.
+
+What it does (MVP):
+- Reads a user-friendly Agent Intake Form (JSON) -> compiles to AgentSpec
+- Validates with clear, user-facing messages
+- Runs a bounded, capability-gated agent loop with mock tools (search, fetch, summarize, write)
+- Produces a brief markdown file and a sources.json (simulated)
+- Computes QA metrics (confidence proxy, rule checks incl. timeframe, self-consistency)
+- Deterministic behavior via stable seeding for reproducible QA
+
+How to run:
+1) Save an intake form as agent_form.json (example auto-generated on first run)
+2) Optionally, save run inputs as run_input.json (example auto-generated)
+3) Run:  python agent_scaffold.py
+   or:   python agent_scaffold.py --form agent_form.json --input run_input.json --out out
+
+No external dependencies. All network/file actions are simulated.
+Replace mock tools with real ones when ready.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import random
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# -----------------------------
+# Data models
+# -----------------------------
+
+@dataclass
+class AgentForm:
+    """User-facing form structure (Section A).
+    Accepts simple keys; missing fields get defaults during compilation.
+    """
+    name: Optional[str] = None
+    goal: Optional[str] = None
+    focus: Optional[str] = None  # comma-separated
+    display: Optional[Dict[str, Any]] = None  # {"Type": "bullet-points|summary|report", "Add-ons": "..."}
+    inputs: Optional[str] = None  # comma-separated
+    tools: Optional[str] = None   # comma-separated
+    specifics: Optional[Dict[str, Any]] = None  # {"Steps": "...", "Domains": {"whitelist": "...", "blacklist": "..."}}
+    approvals: Optional[str] = None  # comma-separated tokens
+    memory: Optional[str] = None  # short|long|both|none
+    complexity: Optional[str] = None  # low|medium|high
+    autonomy: Optional[str] = None  # low|medium|high
+    notes: Optional[str] = None
+
+
+@dataclass
+class AgentSpec:
+    """Machine-leaning spec derived from AgentForm (Section D)."""
+    name: str
+    goal: str
+    tags: List[str]
+    inputs: List[str]
+    outputs: List[str]
+    display_addons: List[str]
+    tools: List[str]
+    plan: Dict[str, List[str]]
+    constraints: Dict[str, Any]
+    approvals: List[str]
+    memory: Dict[str, bool]
+    control: Dict[str, Any]
+    qa: Dict[str, Any]
+    notes: str = ""
+
+
+# -----------------------------
+# Validator
+# -----------------------------
+
+class Validator:
+    TOOL_CATALOG = {
+        "search", "fetch", "summarize", "write", "classify", "extract",
+        "browser", "file_read", "file_write", "codegen"
+    }
+    DISPLAY_TYPES = {"bullet-points", "summary", "report"}
+
+    @staticmethod
+    def validate_form(form: AgentForm) -> Tuple[bool, List[str]]:
+        errors: List[str] = []
+        # Name
+        if not form.name:
+            errors.append("Name is required (2–40 chars).")
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{2,40}", form.name):
+                errors.append("Name must be 2–40 chars, letters/numbers/dash/underscore only.")
+        # Goal
+        if not form.goal or not (1 <= len(form.goal) <= 240):
+            errors.append("Goal is required (1–240 chars).")
+        if form.goal and not re.search(r"\b(prepare|produce|generate|find|summarize|organize|draft|plan|create|build|analyze)\b", form.goal, flags=re.I):
+            errors.append("Goal should contain an action verb (e.g., find, summarize, create).")
+        # Display
+        if form.display and isinstance(form.display, dict):
+            dtype = (form.display.get("Type") or "").strip()
+            if dtype and dtype not in Validator.DISPLAY_TYPES:
+                errors.append("Display.Type must be one of: bullet-points, summary, report.")
+        # Tools
+        if form.tools:
+            for t in [s.strip() for s in form.tools.split(',') if s.strip()]:
+                if t not in Validator.TOOL_CATALOG:
+                    errors.append(f"Tool '{t}' not recognized; allowed: {sorted(Validator.TOOL_CATALOG)}")
+        # Memory
+        if form.memory and form.memory not in {"short", "long", "both", "none"}:
+            errors.append("Memory must be one of: short, long, both, none.")
+        # Complexity / Autonomy
+        if form.complexity and form.complexity not in {"low", "medium", "high"}:
+            errors.append("Complexity must be one of: low, medium, high.")
+        if form.autonomy and form.autonomy not in {"low", "medium", "high"}:
+            errors.append("Autonomy must be one of: low, medium, high.")
+        return (len(errors) == 0, errors)
+
+
+# -----------------------------
+# Compiler: AgentForm -> AgentSpec
+# -----------------------------
+
+class Compiler:
+    DISPLAY_TO_OUTPUT = {
+        "bullet-points": ["brief.md"],
+        "summary": ["summary.md"],
+        "report": ["report.md"],
+    }
+
+    @staticmethod
+    def _split_csv(s: Optional[str]) -> List[str]:
+        if not s:
+            return []
+        return [x.strip() for x in s.split(',') if x.strip()]
+
+    @staticmethod
+    def _bools_from_memory(mem: Optional[str]) -> Dict[str, bool]:
+        mem = (mem or "short").strip().lower()
+        return {
+            "short_term": mem in {"short", "both"},
+            "long_term": mem in {"long", "both"},
+        }
+
+    @staticmethod
+    def _constraints_from_complexity(cplx: Optional[str]) -> Tuple[int, str]:
+        cplx = (cplx or "medium").lower()
+        if cplx == "low":
+            return 4, "shallow"
+        if cplx == "high":
+            return 12, "deep"
+        return 8, "standard"
+
+    @staticmethod
+    def _human_gates_from_autonomy(auto: Optional[str]) -> List[str]:
+        auto = (auto or "medium").lower()
+        if auto == "low":
+            return ["plan", "final"]
+        if auto == "high":
+            return []
+        return ["final"]
+
+    @staticmethod
+    def compile(form: AgentForm) -> AgentSpec:
+        display_type = None
+        addons: List[str] = []
+        if isinstance(form.display, dict):
+            display_type = (form.display.get("Type") or "").strip() or "summary"
+            addons = Compiler._split_csv(form.display.get("Add-ons"))
+        else:
+            display_type = "summary"
+
+        outputs = Compiler.DISPLAY_TO_OUTPUT.get(display_type, ["summary.md"])
+        inputs = Compiler._split_csv(form.inputs) or ["topic"]
+        tools = Compiler._split_csv(form.tools) or ["search", "fetch", "summarize", "write"]
+        tags = Compiler._split_csv(form.focus)
+        approvals = Compiler._split_csv(form.approvals)
+
+        steps: List[str] = []
+        whitelist: List[str] = []
+        blacklist: List[str] = []
+        if isinstance(form.specifics, dict):
+            steps_text = form.specifics.get("Steps") or ""
+            if steps_text:
+                # split on arrows or commas
+                parts = re.split(r"→|->|,", steps_text)
+                steps = [p.strip() for p in parts if p.strip()]
+            dom = form.specifics.get("Domains") or {}
+            wl = dom.get("whitelist") or ""
+            bl = dom.get("blacklist") or ""
+            whitelist = Compiler._split_csv(wl)
+            blacklist = Compiler._split_csv(bl)
+
+        max_steps, depth = Compiler._constraints_from_complexity(form.complexity)
+        human_gates = Compiler._human_gates_from_autonomy(form.autonomy)
+
+        memory = Compiler._bools_from_memory(form.memory)
+
+        # QA defaults enabled
+        qa = {
+            "enable_confidence": True,
+            "checklist": ["plan_exists", "steps_coherent", "constraints_applied", "failures_handled"],
+            "metrics": ["p_action_success", "self_consistency", "rule_checks"],
+        }
+
+        constraints = {
+            "domains_whitelist": whitelist,
+            "domains_blacklist": blacklist,
+            "max_steps": max_steps,
+            "depth": depth,
+            # Optional timeframe hint if present in notes or inputs
+        }
+
+        # Attempt to infer timeframe from notes like "last 24 months"
+        if form.notes and re.search(r"last\s+([0-9]+)\s*(days|weeks|months|years)", form.notes, flags=re.I):
+            num, unit = re.findall(r"last\s+([0-9]+)\s*(days|weeks|months|years)", form.notes, flags=re.I)[0]
+            constraints["timeframe_hint"] = f"{num} {unit}"
+
+        spec = AgentSpec(
+            name=form.name or "agent",
+            goal=form.goal or "",
+            tags=tags,
+            inputs=inputs,
+            outputs=outputs,
+            display_addons=addons,
+            tools=tools,
+            plan={"hints": steps},
+            constraints=constraints,
+            approvals=approvals,
+            memory=memory,
+            control={"human_gates": human_gates},
+            qa=qa,
+            notes=form.notes or "",
+        )
+        return spec
+
+
+# -----------------------------
+# Utility
+# -----------------------------
+
+def _stable_seed_from(text: str) -> int:
+    """Derive a stable 32-bit seed from text (process‑independent)."""
+    digest = hashlib.blake2s(text.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
+def _seconds_from_hint(hint: str) -> Optional[int]:
+    m = re.fullmatch(r"\s*(\d+)\s*(days|weeks|months|years)\s*", hint.strip(), flags=re.I)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    days = {"days": 1, "weeks": 7, "months": 30, "years": 365}[unit]
+    return n * days * 24 * 60 * 60
+
+
+# -----------------------------
+# Mock Tools (replace with real integrations later)
+# -----------------------------
+
+class ToolContext:
+    def __init__(self, spec: AgentSpec, run_input: Dict[str, Any], out_dir: Path):
+        self.spec = spec
+        self.run_input = run_input
+        self.out_dir = out_dir
+        self.logs: List[str] = []
+        self.sources: List[Dict[str, Any]] = []
+
+    def log(self, msg: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        self.logs.append(f"[{stamp}] {msg}")
+
+
+class SearchTool:
+    name = "search"
+    def __call__(self, ctx: ToolContext, query: str) -> List[Dict[str, Any]]:
+        topic = ctx.run_input.get("topic", "topic")
+        ctx.log(f"search: '{query or topic}' → simulated 6 results")
+        rnd = random.Random(_stable_seed_from(topic))
+        results = []
+        for i in range(6):
+            dom = rnd.choice(["example.gov", "example.edu", "news.example", "blog.example"])  # simple variety
+            results.append({
+                "title": f"{topic} – source {i+1}",
+                "url": f"https://{dom}/{topic.replace(' ', '_')}/{i+1}",
+                "ts": int(time.time()) - rnd.randint(0, 60 * 60 * 24 * 600),  # ~20 months
+                "domain": dom,
+            })
+        # Apply whitelist filtering
+        wl = ctx.spec.constraints.get("domains_whitelist", [])
+        if wl:
+            filtered = [r for r in results if any(w.replace("*.", "").lower() in r.get("domain", "").lower() for w in wl)]
+        else:
+            filtered = results
+        # Apply timeframe filtering if available
+        tf_hint = ctx.spec.constraints.get("timeframe_hint")
+        if tf_hint:
+            window = _seconds_from_hint(tf_hint)
+            if window:
+                cutoff = int(time.time()) - window
+                filtered = [r for r in filtered if r.get("ts", 0) >= cutoff]
+                ctx.log(f"filter: timeframe '{tf_hint}' applied → {len(filtered)} results kept")
+        # Deduplicate by URL
+        seen = set()
+        deduped: List[Dict[str, Any]] = []
+        for r in filtered:
+            if r["url"] in seen:
+                continue
+            seen.add(r["url"])
+            deduped.append(r)
+        ctx.sources = deduped[:]  # store filtered sources only
+        return deduped
+
+
+class FetchTool:
+    name = "fetch"
+    def __call__(self, ctx: ToolContext, urls: List[str]) -> List[Dict[str, Any]]:
+        ctx.log(f"fetch: {len(urls)} urls")
+        docs = []
+        for u in urls:
+            docs.append({"url": u, "text": f"Simulated content for {u}"})
+        return docs
+
+
+class SummarizeTool:
+    name = "summarize"
+    def __call__(self, ctx: ToolContext, docs: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        ctx.log(f"summarize: {len(docs)} docs → 3 themes")
+        # Very basic clustering stub
+        return {
+            "Theme: Information Integrity": ["Deepfakes", "Disinfo", "Source verification"],
+            "Theme: Platform Abuse": ["Bots", "Coordinated behavior", "Rate limits"],
+            "Theme: Security & Access": ["Phishing", "MFA", "RBAC"],
+        }
+
+
+class WriteTool:
+    name = "write"
+    def __call__(self, ctx: ToolContext, bullets: List[Dict[str, Any]]) -> Path:
+        out = ctx.out_dir / "brief.md"
+        lines = ["# Brief\n"]
+        for b in bullets:
+            srcs = ", ".join(s.get("url", "") for s in b.get("sources", []))
+            conf = f" (confidence: {b.get('confidence', 0.0):.2f})" if b.get("confidence") is not None else ""
+            lines.append(f"- **{b['title']}** — {b['body']}{conf}\n")
+            if srcs:
+                lines.append(f"  Sources: {srcs}\n")
+        out.write_text("".join(lines), encoding="utf-8")
+        ctx.log(f"write: wrote {out}")
+        # also write sources.json
+        (ctx.out_dir / "sources.json").write_text(json.dumps(ctx.sources, indent=2), encoding="utf-8")
+        return out
+
+
+# -----------------------------
+# Orchestrator & QA
+# -----------------------------
+
+class QA:
+    @staticmethod
+    def probability_of_action_success(history: List[str]) -> float:
+        # naive proxy based on presence of success logs
+        ok = sum(1 for h in history if any(k in h for k in ["simulated", "wrote", "→", "docs"]))
+        return min(1.0, 0.5 + ok / max(4, len(history) + 2))
+
+    @staticmethod
+    def self_consistency_passes(texts: List[str]) -> float:
+        # crude similarity proxy via token overlap
+        if len(texts) < 2:
+            return 1.0
+        a = set(texts[0].lower().split())
+        b = set(texts[1].lower().split())
+        j = len(a & b) / max(1, len(a | b))
+        return 0.6 + 0.4 * j
+
+    @staticmethod
+    def rule_checks(spec: AgentSpec, ctx: ToolContext) -> float:
+        # reward whitelist usage + timeframe compliance + display add-on honoring (coarse)
+        score = 0.7
+        wl = set(spec.constraints.get("domains_whitelist", []))
+        if wl:
+            matched = 0
+            for s in ctx.sources[:6]:
+                dom = s.get("domain", "")
+                if any(w.replace("*.", "").lower() in dom.lower() for w in wl):
+                    matched += 1
+            score += min(0.2, 0.03 * matched)
+        tf_hint = spec.constraints.get("timeframe_hint")
+        if tf_hint:
+            window = _seconds_from_hint(tf_hint) or 0
+            if window:
+                cutoff = int(time.time()) - window
+                fresh = sum(1 for s in ctx.sources if s.get("ts", 0) >= cutoff)
+                ratio = fresh / max(1, len(ctx.sources))
+                score += 0.1 * ratio
+        # If addon requires confidence, ensure bullets had confidence later (checked indirectly via enable_confidence)
+        return min(1.0, score)
+
+
+class Orchestrator:
+    def __init__(self, spec: AgentSpec, out_dir: Path):
+        self.spec = spec
+        self.out_dir = out_dir
+        self.ctx = ToolContext(spec, run_input={}, out_dir=out_dir)
+        # tool registry
+        self.tools = {
+            "search": SearchTool(),
+            "fetch": FetchTool(),
+            "summarize": SummarizeTool(),
+            "write": WriteTool(),
+        }
+
+    def _has_tool(self, name: str) -> bool:
+        return name in self.spec.tools
+
+    def run(self, run_input: Dict[str, Any]) -> Dict[str, Any]:
+        self.ctx.run_input = run_input
+        steps_budget = int(self.spec.constraints.get("max_steps", 8))
+        topic = run_input.get("topic", "topic")
+
+        # PLAN (consumes 1 step)
+        if steps_budget <= 0:
+            raise RuntimeError("Budget exhausted before planning")
+        plan_hints = self.spec.plan.get("hints") or ["collect", "cluster", "bulletize"]
+        self.ctx.log(f"plan: {plan_hints}")
+        steps_budget -= 1
+
+        results: List[Dict[str, Any]] = []
+        if steps_budget > 0 and self._has_tool("search"):
+            results = self.tools["search"](self.ctx, query=topic)
+            steps_budget -= 1
+        else:
+            self.ctx.log("search: skipped (tool not enabled or no budget)")
+
+        # build URL list (bounded)
+        urls: List[str] = [r["url"] for r in results[:5]]
+
+        docs: List[Dict[str, Any]] = []
+        if steps_budget > 0 and urls and self._has_tool("fetch"):
+            docs = self.tools["fetch"](self.ctx, urls=urls)
+            steps_budget -= 1
+        else:
+            self.ctx.log("fetch: skipped (no urls/tool/budget)")
+
+        themes: Dict[str, List[str]] = {}
+        if steps_budget > 0 and docs and self._has_tool("summarize"):
+            themes = self.tools["summarize"](self.ctx, docs=docs)
+            steps_budget -= 1
+        else:
+            self.ctx.log("summarize: skipped (no docs/tool/budget)")
+
+        # Bulletize (consumes 1 step if any themes exist)
+        bullets: List[Dict[str, Any]] = []
+        if steps_budget > 0 and themes:
+            rnd = random.Random(_stable_seed_from(topic))
+            for theme, items in list(themes.items()):
+                problem = f"{items[0]} causes reliability issues"
+                solution = f"Adopt controls for {items[1]} and monitoring for {items[2]}"
+                body = f"Problem: {problem}. Solution: {solution}."
+                confidence = (0.85 + rnd.random() * 0.1) if self.spec.qa.get("enable_confidence", True) else None
+                src_subset = results[:2]
+                bullets.append({
+                    "title": theme,
+                    "body": body,
+                    "confidence": confidence if ("show_confidence" in self.spec.display_addons) else None,
+                    "sources": src_subset if ("include_sources" in self.spec.display_addons) else [],
+                })
+            steps_budget -= 1
+        else:
+            self.ctx.log("bulletize: skipped (no themes/budget)")
+
+        # Write (consumes 1 step if enabled)
+        if steps_budget > 0 and bullets and self._has_tool("write"):
+            outfile = self.tools["write"](self.ctx, bullets)
+            steps_budget -= 1
+        else:
+            outfile = None
+            self.ctx.log("write: skipped (no bullets/tool/budget)")
+
+        # QA
+        p_action = QA.probability_of_action_success(self.ctx.logs)
+        sc = QA.self_consistency_passes([
+            " ".join(b["body"].split()) for b in bullets
+        ][:2])
+        rules = QA.rule_checks(self.spec, self.ctx)
+        chain_accuracy = min(1.0, 0.4 * p_action + 0.3 * sc + 0.3 * rules)
+
+        qa_report = {
+            "p_action_success": round(p_action, 3),
+            "self_consistency": round(sc, 3),
+            "rule_checks": round(rules, 3),
+            "chain_accuracy": round(chain_accuracy, 3),
+            "budget_remaining": steps_budget,
+        }
+
+        return {
+            "outfile": str(outfile) if outfile else None,
+            "bullets": bullets,
+            "qa": qa_report,
+            "logs": self.ctx.logs,
+            "sources": self.ctx.sources,
+        }
+
+
+# -----------------------------
+# I/O helpers
+# -----------------------------
+
+EXAMPLE_FORM = {
+    "Name": "researcher",
+    "Goal": "Find reliable sources on topic X and output bullet points of problems and solutions.",
+    "Focus": "reliability, modern solutions",
+    "Display": {"Type": "bullet-points", "Add-ons": "include_sources, show_confidence, group_by_theme"},
+    "Inputs": "topic, depth, timeframe",
+    "Tools": "search, fetch, summarize, write",
+    "Specifics": {
+        "Steps": "collect → cluster → deduplicate → bulletize",
+        "Domains": {"whitelist": "*.gov, *.edu, reputable news"}
+    },
+    "Approvals": "",
+    "Memory": "both",
+    "Complexity": "medium",
+    "Autonomy": "medium",
+    "Notes": "Prefer sources published in the last 24 months."
+}
+
+EXAMPLE_RUN_INPUT = {"topic": "AI safety and elections", "depth": "brief", "timeframe": "24 months"}
+
+
+def load_form(path: Path) -> AgentForm:
+    if not path.exists():
+        path.write_text(json.dumps(EXAMPLE_FORM, indent=2), encoding="utf-8")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    # map user keys to AgentForm fields (case-insensitive)
+    def get(k: str):
+        for key in raw.keys():
+            if key.lower() == k.lower():
+                return raw[key]
+        return None
+    return AgentForm(
+        name=get("Name"),
+        goal=get("Goal"),
+        focus=get("Focus"),
+        display=get("Display"),
+        inputs=get("Inputs"),
+        tools=get("Tools"),
+        specifics=get("Specifics"),
+        approvals=get("Approvals"),
+        memory=get("Memory"),
+        complexity=get("Complexity"),
+        autonomy=get("Autonomy"),
+        notes=get("Notes"),
+    )
+
+
+def load_run_input(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        path.write_text(json.dumps(EXAMPLE_RUN_INPUT, indent=2), encoding="utf-8")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Agent-of-Agents scaffold (mock tools)")
+    parser.add_argument("--form", default="agent_form.json", help="Path to agent intake form (JSON)")
+    parser.add_argument("--input", default="run_input.json", help="Path to run input JSON")
+    parser.add_argument("--out", default="out", help="Output directory")
+    args = parser.parse_args(argv)
+
+    form_path = Path(args.form)
+    input_path = Path(args.input)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    form = load_form(form_path)
+    ok, errs = Validator.validate_form(form)
+    if not ok:
+        print("Validation errors:")
+        for e in errs:
+            print(" -", e)
+        return 2
+
+    spec = Compiler.compile(form)
+
+    # Echo compiled spec (human-readable)
+    compiled_path = out_dir / "compiled_spec.json"
+    compiled_path.write_text(json.dumps(dataclasses.asdict(spec), indent=2), encoding="utf-8")
+    print(f"Compiled spec → {compiled_path}")
+
+    run_input = load_run_input(input_path)
+    orch = Orchestrator(spec, out_dir)
+    result = orch.run(run_input)
+
+    # Save artifacts
+    (out_dir / "qa.json").write_text(json.dumps(result["qa"], indent=2), encoding="utf-8")
+    (out_dir / "logs.txt").write_text("\n".join(result["logs"]), encoding="utf-8")
+    (out_dir / "bullets.json").write_text(json.dumps(result["bullets"], indent=2), encoding="utf-8")
+    (out_dir / "sources.json").write_text(json.dumps(result["sources"], indent=2), encoding="utf-8")
+
+    print("Run complete.")
+    print("Artifacts:")
+    print(f" - {result.get('outfile') or 'brief.md (skipped)'}")
+    print(f" - {out_dir / 'qa.json'}")
+    print(f" - {out_dir / 'logs.txt'}")
+    print(f" - {out_dir / 'bullets.json'}")
+    print(f" - {out_dir / 'sources.json'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
